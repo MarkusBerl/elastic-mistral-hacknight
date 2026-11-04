@@ -12,13 +12,17 @@ from datetime import datetime, timedelta
 
 import requests
 from elasticsearch import Elasticsearch, helpers
-from mistralai.client import Mistral
+try:
+    from mistralai import Mistral          # mistralai 1.x
+except ImportError:
+    from mistralai.client import Mistral   # mistralai 3.x
 
 # ---------- config (.env next to this file, never committed) ----------
-for line in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')):
-    if '=' in line:
+_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+for line in (open(_env) if os.path.exists(_env) else []):
+    if '=' in line and not line.lstrip().startswith('#'):
         k, v = line.strip().split('=', 1)
-        os.environ.setdefault(k, v)
+        os.environ.setdefault(k.strip(), v.strip().strip('"\''))
 
 MISTRAL_KEY = os.environ['MISTRAL_API_KEY']
 INDEX = 'fixit_311'

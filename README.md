@@ -20,7 +20,7 @@ Data: [Rec & Park properties](https://data.sf.gov/d/gtr9-ntp6) and ~7k recent [3
 ## Run
 
 ```bash
-pip install elasticsearch mistralai requests
+pip install -r requirements.txt
 cat > .env <<'X'
 ES_URL=https://<project>.es.<region>.elastic.cloud
 ES_API_KEY=...
