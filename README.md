@@ -1,0 +1,2 @@
+# elastic-mistral-hacknight
+Hackathon
