@@ -9,15 +9,19 @@ Elasticsearch geo + semantic queries, then picks and explains the landing zone.
   python droplz.py setup
   python droplz.py ask "Drop a burrito order for someone at 24th St and Valencia"
 """
-import json, math, sys
+import json, math, os, sys
 
 import requests
 from elasticsearch import helpers
 
 import fixit311 as base  # loads .env, Mistral client, ES client, 311 cache/ingest
 
-ZONES = 'droplz_zones'
-HAZARDS = base.INDEX            # fixit_311: 311 cases with Mistral semantic_text
+# Works with our own indices (python droplz.py setup) or the starter notebooks' indices:
+#   ZONES_INDEX=sf_parks HAZARDS_INDEX=sf_311_cases python droplz.py ask "..."
+ZONES = os.environ.get('ZONES_INDEX', 'droplz_zones')
+HAZARDS = os.environ.get('HAZARDS_INDEX', base.INDEX)   # fixit_311: 311 cases with Mistral semantic_text
+HAZARD_TYPES = ['Encampment', 'Blocked Street and Sidewalk', 'Street and Sidewalk Cleaning', 'Tree Maintenance',
+                'Streetlights', 'Street Defect', 'Damage Property', 'Noise', 'Sidewalk and Curb']
 HAZARD_QUERY = ('people camping or sleeping, encampment, blocked sidewalk, debris or garbage pile, '
                 'abandoned scooters or bikes, low tree branches, fallen tree, broken streetlight, unsafe area')
 CHAT = base.CHAT_MODEL
@@ -59,12 +63,31 @@ def setup():
 
 # ---------- tools the Mistral agent can call ----------
 def lookup_place(text):
-    """Geocode with Elasticsearch: best match among park names and 311 addresses."""
-    r = es.search(index=[ZONES, HAZARDS], size=1, query={'multi_match': {
-        'query': text, 'fields': ['name^2', 'address']}}, source=['name', 'address', 'location', 'neighborhood'])
+    """Geocode with Elasticsearch: a strong match on a park name or a 311 address, else not found."""
+    import re
+    q = re.sub(r'(?i)\b(san francisco|sf|ca|california|intersection of|street|st\.?)\b|,', ' ', text).strip()
+    r = es.search(index=[ZONES, HAZARDS], size=1, query={'bool': {'should': [
+        {'match': {'name': {'query': q, 'operator': 'and', 'boost': 2}}},
+        {'match': {'address': {'query': q, 'operator': 'and'}}}]}},
+        source=['name', 'address', 'location', 'neighborhood'])
     if not r['hits']['hits']:
-        return {'found': False}
+        return {'found': False, 'hint': 'use your own best estimate of SF coordinates'}
     return {'found': True, **r['hits']['hits'][0]['_source']}
+
+
+_semantic = None
+
+
+def hazard_query():
+    """Mistral semantic search if the hazard index has our semantic_text field, else category match."""
+    global _semantic
+    if _semantic is None:
+        props = next(iter(es.indices.get_mapping(index=HAZARDS).values()))['mappings']['properties']
+        _semantic = props.get('text', {}).get('type') == 'semantic_text'
+        print(f'[hazard search: {"Mistral semantic_text" if _semantic else "category fallback"} on {HAZARDS}]')
+    if _semantic:
+        return {'semantic': {'field': 'text', 'query': HAZARD_QUERY}}
+    return {'match_all': {}}  # hazard types are filtered in find_landing_zones
 
 
 def find_landing_zones(lat, lon, max_walk_m=800, min_acres=0.2):
@@ -74,20 +97,23 @@ def find_landing_zones(lat, lon, max_walk_m=800, min_acres=0.2):
         {'geo_distance': {'distance': f'{max_walk_m}m', 'location': here}},
         {'range': {'acres': {'gte': min_acres}}}]}},
         sort=[{'_geo_distance': {'location': here, 'order': 'asc', 'unit': 'm'}}],
-        source=['name', 'type', 'acres', 'neighborhood', 'location'])
+        source=['name', 'type', 'property_type', 'acres', 'neighborhood', 'location'])
     zones = []
     for h in r['hits']['hits']:
         z = h['_source'] | {'walk_m': round(h['sort'][0])}
-        # hazards: open 311 reports within 75 m that *mean* "unsafe to land", via Mistral embeddings
+        z['acres'] = z.get('acres') or 0
+        # hazards: open 311 reports of hazard types within 150 m (Elastic geo filter + terms agg),
+        # ranked by Mistral semantic similarity to "unsafe to land here" so the agent sees the worst ones
         hz = es.search(index=HAZARDS, size=3, query={'bool': {
-            'must': {'semantic': {'field': 'text', 'query': HAZARD_QUERY}},
-            'filter': [{'geo_distance': {'distance': '75m', 'location': z['location']}},
-                       {'term': {'status': 'Open'}}]}},
+            'should': [hazard_query()],
+            'filter': [{'geo_distance': {'distance': '150m', 'location': z['location']}},
+                       {'term': {'status': 'Open'}}, {'terms': {'service_name': HAZARD_TYPES}}]}},
             aggs={'kinds': {'terms': {'field': 'service_name', 'size': 5}}},
-            source=['service_name', 'service_subtype', 'requested_at'])
-        z['open_hazards_75m'] = hz['hits']['total']['value']
+            source=['service_name', 'text', 'requested_at'])
+        z['open_hazards_150m'] = hz['hits']['total']['value']
         z['hazard_kinds'] = {b['key']: b['doc_count'] for b in hz['aggregations']['kinds']['buckets']}
-        z['score'] = round(10 * math.log1p(z['acres']) - 3 * z['open_hazards_75m'] - z['walk_m'] / 100, 1)
+        z['worst_reports'] = [h['_source'].get('text', h['_source']['service_name'])[:120] for h in hz['hits']['hits']]
+        z['score'] = round(10 * math.log1p(z['acres']) - 1.5 * z['open_hazards_150m'] - z['walk_m'] / 100, 1)
         zones.append(z)
     return sorted(zones, key=lambda z: -z['score'])
 
@@ -99,7 +125,7 @@ TOOLS = [
     {'type': 'function', 'function': {
         'name': 'find_landing_zones',
         'description': 'Rank open-space drone landing zones near a drop-off point by size, walking distance '
-                       'and nearby open 311 hazard reports.',
+                       'and open 311 hazard reports within 150 m.',
         'parameters': {'type': 'object', 'properties': {
             'lat': {'type': 'number'}, 'lon': {'type': 'number'},
             'max_walk_m': {'type': 'integer', 'description': 'max walk from zone to customer, default 800'},
@@ -136,7 +162,7 @@ def ask(request):
             if c.function.name == 'find_landing_zones':
                 for z in out[:5]:
                     print(f"  {z['score']:6.1f}  {z['name']:38s} {z['acres']:6.1f} ac  {z['walk_m']:4d} m  "
-                          f"hazards {z['open_hazards_75m']} {z['hazard_kinds']}")
+                          f"hazards {z['open_hazards_150m']} {z['hazard_kinds']}")
             else:
                 print('  ', out)
             msgs.append({'role': 'tool', 'name': c.function.name, 'tool_call_id': c.id,

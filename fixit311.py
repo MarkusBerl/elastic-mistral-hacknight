@@ -27,6 +27,8 @@ CHAT_MODEL = 'mistral-large-latest'
 RADIUS = os.environ.get('RADIUS', '400m')
 DAYS = 21
 PER_TYPE = 350
+HAZARD_HEAVY = {'Encampment', 'Blocked Street and Sidewalk', 'Street and Sidewalk Cleaning', 'Tree Maintenance',
+                'Streetlights', 'Street Defect', 'Damage Property', 'Sidewalk and Curb'}
 
 mistral = Mistral(api_key=MISTRAL_KEY)
 
@@ -47,7 +49,8 @@ def fetch_cases():
         name = t['service_name'].replace("'", "''")
         batch = requests.get(url, params={
             '$where': f"requested_datetime > '{since}' AND service_name = '{name}'",
-            '$order': 'requested_datetime DESC', '$limit': PER_TYPE}, timeout=120).json()
+            '$order': 'requested_datetime DESC',
+            '$limit': 1000 if t['service_name'] in HAZARD_HEAVY else 120}, timeout=120).json()
         rows += batch
         print(f'  {t["service_name"]:45s} {len(batch)}')
     return rows
