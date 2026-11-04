@@ -1,4 +1,4 @@
-"""DropZone SF: find a safe drone-delivery landing zone near any SF address.
+"""DropZone SF: find a safe drone passenger-pickup zone near any SF address.
 
 Candidate zones: every Rec & Park property (DataSF gtr9-ntp6), as geo_point + geo_shape.
 Hazards: recent 311 reports (encampments, blocked sidewalks, debris, trees, scooters...)
@@ -7,7 +7,7 @@ A Mistral function-calling agent turns a plain-English delivery request into
 Elasticsearch geo + semantic queries, then picks and explains the landing zone.
 
   python droplz.py setup
-  python droplz.py ask "Drop a burrito order for someone at 24th St and Valencia"
+  python droplz.py ask "Two of us need a ride from Turk and Jones, one suitcase"
 """
 import json, math, os, sys
 
@@ -25,6 +25,7 @@ HAZARD_TYPES = ['Encampment', 'Blocked Street and Sidewalk', 'Street and Sidewal
 HAZARD_QUERY = ('people camping or sleeping, encampment, blocked sidewalk, debris or garbage pile, '
                 'abandoned scooters or bikes, low tree branches, fallen tree, broken streetlight, unsafe area')
 CHAT = base.CHAT_MODEL
+ENCAMPMENT_PENALTY = 10   # people on the ground under a landing passenger drone: hard no
 es = None
 
 
@@ -97,7 +98,7 @@ def find_landing_zones(lat, lon, max_walk_m=800, min_acres=0.2):
         {'geo_distance': {'distance': f'{max_walk_m}m', 'location': here}},
         {'range': {'acres': {'gte': min_acres}}}]}},
         sort=[{'_geo_distance': {'location': here, 'order': 'asc', 'unit': 'm'}}],
-        source=['name', 'type', 'property_type', 'acres', 'neighborhood', 'location'])
+        source=['name', 'type', 'property_type', 'acres', 'neighborhood', 'address', 'location'])
     zones = []
     for h in r['hits']['hits']:
         z = h['_source'] | {'walk_m': round(h['sort'][0])}
@@ -113,7 +114,9 @@ def find_landing_zones(lat, lon, max_walk_m=800, min_acres=0.2):
         z['open_hazards_150m'] = hz['hits']['total']['value']
         z['hazard_kinds'] = {b['key']: b['doc_count'] for b in hz['aggregations']['kinds']['buckets']}
         z['worst_reports'] = [h['_source'].get('text', h['_source']['service_name'])[:120] for h in hz['hits']['hits']]
-        z['score'] = round(10 * math.log1p(z['acres']) - 1.5 * z['open_hazards_150m'] - z['walk_m'] / 100, 1)
+        enc = z['hazard_kinds'].get('Encampment', 0)
+        z['score'] = round(10 * math.log1p(z['acres']) - 1.5 * (z['open_hazards_150m'] - enc)
+                           - ENCAMPMENT_PENALTY * enc - z['walk_m'] / 100, 1)
         zones.append(z)
     return sorted(zones, key=lambda z: -z['score'])
 
@@ -124,27 +127,56 @@ TOOLS = [
         'parameters': {'type': 'object', 'properties': {'text': {'type': 'string'}}, 'required': ['text']}}},
     {'type': 'function', 'function': {
         'name': 'find_landing_zones',
-        'description': 'Rank open-space drone landing zones near a drop-off point by size, walking distance '
-                       'and open 311 hazard reports within 150 m.',
+        'description': 'Rank open-space drone pickup zones near the rider by size, walking distance, '
+                       'encampments and other open 311 hazard reports within 150 m.',
         'parameters': {'type': 'object', 'properties': {
             'lat': {'type': 'number'}, 'lon': {'type': 'number'},
-            'max_walk_m': {'type': 'integer', 'description': 'max walk from zone to customer, default 800'},
+            'max_walk_m': {'type': 'integer', 'description': 'max walk from rider to zone, default 800'},
             'min_acres': {'type': 'number', 'description': 'minimum open area, default 0.2'}},
             'required': ['lat', 'lon']}}},
 ]
 IMPL = {'lookup_place': lookup_place, 'find_landing_zones': find_landing_zones}
 
 
+def parse_request(text):
+    """Mistral structured outputs: rider's free text -> pickup requirements that drive the Elastic query."""
+    schema = {'type': 'object', 'additionalProperties': False,
+              'required': ['pickup_place', 'passengers', 'luggage_pieces', 'wheelchair', 'urgency', 'language'],
+              'properties': {
+                  'pickup_place': {'type': 'string', 'description': 'address, intersection or landmark in SF'},
+                  'passengers': {'type': 'integer'},
+                  'luggage_pieces': {'type': 'integer'},
+                  'wheelchair': {'type': 'boolean'},
+                  'urgency': {'type': 'string', 'enum': ['normal', 'urgent', 'medical']},
+                  'language': {'type': 'string'}}}
+    r = base.mistral.chat.complete(model=CHAT, temperature=0, messages=[
+        {'role': 'system', 'content': 'Extract a drone ride request in San Francisco.'},
+        {'role': 'user', 'content': text}],
+        response_format={'type': 'json_schema', 'json_schema': {'name': 'ride', 'schema': schema, 'strict': True}})
+    ride = json.loads(r.choices[0].message.content)
+    # requirements -> query parameters: bigger craft needs more open ground; wheelchair/urgent = short walk
+    ride['min_acres'] = round(0.5 + 0.25 * max(0, ride['passengers'] - 1) + 0.1 * ride['luggage_pieces'], 2)
+    ride['max_walk_m'] = 300 if ride['wheelchair'] or ride['urgency'] == 'medical' else 800
+    return ride
+
+
 def ask(request):
     global es
     es = base.es_client()
+    ride = parse_request(request)
+    print('[Mistral structured output]\n' + json.dumps(ride, indent=2, ensure_ascii=False))
     msgs = [{'role': 'system', 'content':
-             'You are DropZone SF, the dispatcher for a food-delivery drone in San Francisco. '
-             'Locate the customer (use lookup_place; if it fails, use your own best SF coordinates), '
-             'then call find_landing_zones. Pick ONE zone, give a runner-up, and in <=5 lines explain why: '
-             'size, walk distance, and the hazard reports. Never pick a zone with many open hazards if a '
-             'cleaner one exists. Reply in the language of the request.'},
-            {'role': 'user', 'content': request}]
+             'You are DropZone SF, the dispatcher for a passenger drone in San Francisco. A drone lands to '
+             'pick up the rider, so the zone must be open ground with no people camping nearby. '
+             'Locate the rider (use lookup_place; if it fails, use your own best SF coordinates), then call '
+             'find_landing_zones with the min_acres and max_walk_m from the ride requirements. Pick ONE zone, '
+             'give a runner-up, and in <=5 lines tell the rider where to walk and why it is safe: size, walk '
+             'distance, hazard reports. Never pick a zone with encampments if a cleaner one exists. '
+             'Always state each zone\'s exact Encampment count from hazard_kinds. If every candidate has '
+             'encampments, say so plainly and suggest a larger max_walk_m search or an escorted pickup. '
+             'Use ONLY facts from the tool results (zone address, acres, walk, hazards); never invent addresses, '
+             'cleaning schedules or surface types. Reply in the rider\'s language.'},
+            {'role': 'user', 'content': f'Rider said: {request}\n\nRide requirements (structured): {json.dumps(ride)}'}]
     for _ in range(6):
         r = base.mistral.chat.complete(model=CHAT, messages=msgs, tools=TOOLS, tool_choice='auto')
         m = r.choices[0].message
